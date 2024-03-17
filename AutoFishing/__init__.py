@@ -1,13 +1,25 @@
+import typing as typ
+
 import numpy as np
 import dbus
-import re
+import time
+
+from pynput.mouse import Button as mBtn
+from pynput.mouse import Controller as mCon
+from pynput.keyboard import Key as kKey
+from pynput.keyboard import Controller as kCon
 
 from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
 import gi
 gi.require_version("Gst", "1.0")
-from gi.repository import GObject, Gst
+gi.require_version('GstVideo', '1.0')
+gi.require_version('GstApp', '1.0')
+from gi.repository import GObject, Gst, GstVideo, GstApp
+from .gst_toolbox import utils as gstutils
+
+from .simple_image_process import split_by_color_distance, cutout_center
 
 
 DBusGMainLoop(set_as_default=True)
@@ -39,6 +51,35 @@ def on_gst_message(bus, message, loop):
     return True
 
 
+def extract_buffer(sample: Gst.Sample, channel_count=0) -> np.ndarray:
+    """Extracts Gst.Buffer from Gst.Sample and converts to np.ndarray"""
+
+    buffer = sample.get_buffer()  # Gst.Buffer
+
+    # print(buffer.pts, buffer.dts, buffer.offset)
+
+    caps_format = sample.get_caps().get_structure(0)  # Gst.Structure
+
+    # GstVideo.VideoFormat
+    video_format = GstVideo.VideoFormat.from_string(
+        caps_format.get_value('format'))
+
+    w, h = caps_format.get_value('width'), caps_format.get_value('height')
+    if channel_count > 0:
+        c = channel_count
+    else:
+        # TODO: fix this
+        c = gstutils.get_num_channels(video_format)
+
+    buffer_size = buffer.get_size()
+    shape = (h, w, c) if (h * w * c == buffer_size) else buffer_size
+    array = np.ndarray(shape=shape, buffer=buffer.extract_dup(0, buffer_size),
+                       dtype=gstutils.get_np_dtype(video_format))
+
+    return np.squeeze(array)  # remove single dimension if exists
+
+
+# adapted from https://gitlab.gnome.org/-/snippets/19
 class AutoFishing:
 
     request_iface = 'org.freedesktop.portal.Request'
@@ -61,6 +102,12 @@ class AutoFishing:
         self.session = None
         self.session_path = None
         self.session_token = None
+
+        self.mouse = mCon()
+        self.keyboard = kCon()
+        self.autofishing_state = dict()
+        self.autofishing_state['starting'] = True
+        self.autofishing_state['on_going'] = False
 
     def terminate(self):
         if self.pipeline is not None:
@@ -135,13 +182,77 @@ class AutoFishing:
 
     # This is also the actual streaming program
     def play_pipewire_stream(self, node_id):
+        LEAKY_Q = 'queue max-size-buffers=1 leaky=downstream'
+        app_sink = "appsink emit-signals=True name=autofishing"
+
         empty_dict = dbus.Dictionary(signature="sv")
         fd_object = self.cast_interface.OpenPipeWireRemote(self.session, empty_dict,
                                             dbus_interface=self.screen_cast_iface)
         fd = fd_object.take()
-        pipeline = Gst.parse_launch('pipewiresrc fd=%d path=%u ! videoconvert ! autovideosink' % (fd, node_id))
-        pipeline.set_state(Gst.State.PLAYING)
+        pipeline_script = 'pipewiresrc fd={fd} path={path} ! videoconvert ! capsfilter caps=video/x-raw,format=BGRA ! {leaky_q} ! {appsink}'.format(fd=fd, path=node_id, leaky_q=LEAKY_Q, appsink=app_sink)
+        pipeline = Gst.parse_launch(pipeline_script)
+        
+        app_sink_obj = pipeline.get_by_name('autofishing')
+        app_sink_obj.connect("new-sample", self.on_fishing_new_frame, None)
+
         pipeline.get_bus().connect('message', on_gst_message)
+        pipeline.set_state(Gst.State.PLAYING)
+    
+    def on_fishing_new_frame(self, sink: GstApp.AppSink, data: typ.Any) -> Gst.FlowReturn:
+        """Callback on 'new-sample' signal"""
+        # Emit 'pull-sample' signal
+        # https://lazka.github.io/pgi-docs/GstApp-1.0/classes/AppSink.html#GstApp.AppSink.signals.pull_sample
+        sample = sink.emit("pull-sample")  # Gst.Sample
+        if isinstance(sample, Gst.Sample):
+            array = extract_buffer(sample, channel_count=4)
+            # print(
+            #     "Received {type} with shape {shape} of type {dtype}".format(
+            #         type=type(array),
+            #         shape=array.shape,
+            #         dtype=array.dtype
+            #     )
+            # )
+            
+            ##### Autofishing stuff #####
+
+            if self.autofishing_state['starting']:
+                log.info("Preparing auto-fishing")
+                time.sleep(5)
+                self.keyboard.press(kKey.esc)
+                self.keyboard.release(kKey.esc)
+                time.sleep(1)
+                self.use_fishing_rod()
+                time.sleep(2)
+                self.autofishing_state['starting'] = False
+                return Gst.FlowReturn.OK
+
+            # assume full screen
+            window_center = cutout_center(array, width=20, height=20)
+            window_center = window_center[:,:,:3]
+            split_mask = split_by_color_distance(window_center, np.array([0,0,0]), 10)
+            a = np.sum(split_mask)
+            b = np.prod(np.shape(split_mask))
+            ratio = a/b
+            log.debug("Ratio: {}".format(ratio))
+
+            # wait for fish
+            if ratio > 0.025:
+                return Gst.FlowReturn.OK
+            
+            # fish caught
+            log.info("Fish caught (possibly)")
+            self.use_fishing_rod()
+            time.sleep(1)
+            log.info("Start another round")
+            self.use_fishing_rod()
+            time.sleep(2)
+
+            return Gst.FlowReturn.OK
+        return Gst.FlowReturn.ERROR
+
+    def use_fishing_rod(self):
+        self.mouse.press(mBtn.right)
+        self.mouse.release(mBtn.right)
 
     ### TEST ###
 
