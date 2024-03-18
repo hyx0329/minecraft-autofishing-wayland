@@ -33,24 +33,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 log = logging.getLogger("AutoFishing")
 
 
-def on_gst_message(bus, message, loop):
-    """Pipeline message handler, not necessarily required
-    """
-    t = message.type
-    if t == Gst.MessageType.EOS:
-        loop.quit()
-    elif t == Gst.MessageType.WARNING:
-        err, debug = message.parse_warning()
-        log.warning('{}: {}\n'.format(err, debug))
-    elif t == Gst.MessageType.ERROR:
-        err, debug = message.parse_error()
-        log.error('{}: {}\n'.format(err, debug))
-        loop.quit()
-    else:
-        log.debug("Got something from bus: %s" % t)
-    return True
-
-
 def extract_buffer(sample: Gst.Sample, channel_count=0) -> np.ndarray:
     """Extracts Gst.Buffer from Gst.Sample and converts to np.ndarray"""
 
@@ -112,6 +94,7 @@ class AutoFishing:
     def terminate(self):
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
         self.gst_loop.quit()
 
     def new_request_path(self):
@@ -191,11 +174,14 @@ class AutoFishing:
         fd = fd_object.take()
         pipeline_script = 'pipewiresrc fd={fd} path={path} ! videoconvert ! capsfilter caps=video/x-raw,format=BGRA ! {leaky_q} ! {appsink}'.format(fd=fd, path=node_id, leaky_q=LEAKY_Q, appsink=app_sink)
         pipeline = Gst.parse_launch(pipeline_script)
+        self.pipeline = pipeline
         
         app_sink_obj = pipeline.get_by_name('autofishing')
         app_sink_obj.connect("new-sample", self.on_fishing_new_frame, None)
 
-        pipeline.get_bus().connect('message', on_gst_message)
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message', self.on_gst_message)
         pipeline.set_state(Gst.State.PLAYING)
     
     def on_fishing_new_frame(self, sink: GstApp.AppSink, data: typ.Any) -> Gst.FlowReturn:
@@ -253,6 +239,23 @@ class AutoFishing:
     def use_fishing_rod(self):
         self.mouse.press(mBtn.right)
         self.mouse.release(mBtn.right)
+    
+    def on_gst_message(self, bus, message):
+        """Pipeline message handler, not necessarily required
+        """
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            self.terminate()
+        elif t == Gst.MessageType.WARNING:
+            err, debug = message.parse_warning()
+            log.warning('{}: {}\n'.format(err, debug))
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            log.error('{}: {}\n'.format(err, debug))
+            self.terminate()
+        else:
+            log.debug("Got something from bus: %s" % t)
+        return True
 
     ### TEST ###
 
